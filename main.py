@@ -3,7 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
-import redis, json, asyncio, logging, os
+import asyncio, logging, os, json
+import httpx  # Upstash REST client
 
 # ------------------------
 # App Init
@@ -12,7 +13,7 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
 # ------------------------
-# CORS Setup
+# CORS
 # ------------------------
 origins = ["https://anshtechgears.netlify.app"]
 app.add_middleware(
@@ -35,26 +36,11 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 # ------------------------
-# Redis Setup (Fail-safe)
-# ------------------------
-REDIS_URL = os.getenv("REDIS_URL")
-if not REDIS_URL:
-    raise Exception("REDIS_URL not set in environment variables")
-try:
-    redis_client = redis.Redis.from_url(REDIS_URL)
-    redis_client.ping()
-    logging.info(f"Connected to Redis at {REDIS_URL}")
-except Exception as e:
-    raise Exception(f"Cannot connect to Redis: {e}")
-
-CHANNEL = "notifications"
-
-# ------------------------
 # Firebase Setup
 # ------------------------
 cred_path = "serviceAccountKey.json"
 if not os.path.exists(cred_path):
-    raise Exception(f"{cred_path} not found! Place your Firebase service account key here.")
+    raise Exception(f"{cred_path} not found!")
 cred = credentials.Certificate(cred_path)
 firebase_admin.initialize_app(cred)
 
@@ -93,28 +79,24 @@ async def get_connected_users():
     return {"users": list(manager.connections.keys())}
 
 # ------------------------
-# Redis Listener (Background)
+# Upstash Redis Setup
 # ------------------------
-async def redis_listener():
-    pubsub = redis_client.pubsub()
-    pubsub.subscribe(CHANNEL)
-    logging.info(f"Subscribed to Redis channel: {CHANNEL}")
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+CHANNEL = "notifications"
 
-    while True:
+async def upstash_publish(channel, message):
+    async with httpx.AsyncClient() as client:
         try:
-            message = pubsub.get_message()
-            if message and message["type"] == "message":
-                data = json.loads(message["data"])
-                user_id = data.get("user_id")
-                await manager.send(user_id, data)
+            payload = {
+                "cmd": "PUBLISH",
+                "channel": channel,
+                "message": json.dumps(message)
+            }
+            headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+            await client.post(UPSTASH_URL, json=payload, headers=headers)
         except Exception as e:
-            logging.error(f"Redis listener error: {e}")
-        await asyncio.sleep(0.01)
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(redis_listener())
-    logging.info("Redis listener started")
+            logging.error(f"Upstash publish error: {e}")
 
 # ------------------------
 # WebSocket Endpoint
@@ -157,6 +139,7 @@ async def notify(data: dict = Body(...)):
             uids = [user.uid for user in page.users]
             for uid in uids:
                 await manager.send(uid, {**payload, "user_id": uid})
+                await upstash_publish(CHANNEL, {**payload, "user_id": uid})
             logging.info(f"Broadcast sent to {len(uids)} users")
         except Exception as e:
             logging.error(f"Failed to broadcast: {e}")
@@ -166,5 +149,6 @@ async def notify(data: dict = Body(...)):
     # ---- Single user ----
     else:
         await manager.send(user_id, {**payload, "user_id": user_id})
+        await upstash_publish(CHANNEL, {**payload, "user_id": user_id})
         logging.info(f"Message sent to {user_id}")
         return {"status": "sent", "user_id": user_id}
