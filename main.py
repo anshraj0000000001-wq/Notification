@@ -4,7 +4,7 @@ from fastapi.responses import JSONResponse
 import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 import asyncio, logging, os, json
-import httpx  # Upstash REST client
+from upstash_redis import Redis
 
 # ------------------------
 # App Init
@@ -13,7 +13,7 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
 # ------------------------
-# CORS
+# CORS Setup
 # ------------------------
 origins = ["https://anshtechgears.netlify.app"]
 app.add_middleware(
@@ -43,6 +43,21 @@ if not os.path.exists(cred_path):
     raise Exception(f"{cred_path} not found!")
 cred = credentials.Certificate(cred_path)
 firebase_admin.initialize_app(cred)
+
+# ------------------------
+# Upstash Redis Setup
+# ------------------------
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+CHANNEL = "notifications"
+
+redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
+
+async def upstash_publish(channel, message):
+    try:
+        redis.publish(channel, json.dumps(message))
+    except Exception as e:
+        logging.error(f"Upstash publish failed: {e}")
 
 # ------------------------
 # Connection Manager
@@ -79,26 +94,6 @@ async def get_connected_users():
     return {"users": list(manager.connections.keys())}
 
 # ------------------------
-# Upstash Redis Setup
-# ------------------------
-UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
-UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
-CHANNEL = "notifications"
-
-async def upstash_publish(channel, message):
-    async with httpx.AsyncClient() as client:
-        try:
-            payload = {
-                "cmd": "PUBLISH",
-                "channel": channel,
-                "message": json.dumps(message)
-            }
-            headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-            await client.post(UPSTASH_URL, json=payload, headers=headers)
-        except Exception as e:
-            logging.error(f"Upstash publish error: {e}")
-
-# ------------------------
 # WebSocket Endpoint
 # ------------------------
 @app.websocket("/ws")
@@ -107,11 +102,9 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         decoded = firebase_auth.verify_id_token(token)
         user_id = decoded["uid"]
-    except Exception as e:
-        logging.warning(f"Invalid Firebase token: {e}")
+    except:
         await websocket.close()
         return
-
     await manager.connect(user_id, websocket)
     try:
         while True:
@@ -132,7 +125,7 @@ async def notify(data: dict = Body(...)):
 
     payload = {"type": "notification", "message": message}
 
-    # ---- Broadcast to all Firebase users ----
+    # Broadcast to all users
     if user_id.upper() == "ALL" or user_id == "":
         try:
             page = firebase_auth.list_users()
@@ -146,7 +139,7 @@ async def notify(data: dict = Body(...)):
             return {"status": "failed", "reason": str(e)}
         return {"status": "broadcast_sent", "users": len(uids)}
 
-    # ---- Single user ----
+    # Single user
     else:
         await manager.send(user_id, {**payload, "user_id": user_id})
         await upstash_publish(CHANNEL, {**payload, "user_id": user_id})
