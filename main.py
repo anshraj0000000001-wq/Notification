@@ -6,7 +6,27 @@ import json
 import asyncio
 import logging
 import os
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi import Request
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"message": f"Internal Server Error: {str(exc)}"},
+    )
+origins = [
+    "https://anshtechgears.netlify.app",  # tumhara frontend
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,     # sirf ye domain allow hoga
+    allow_credentials=True,
+    allow_methods=["*"],       # GET, POST, etc
+    allow_headers=["*"],       # Content-Type, Authorization
+)
 # ------------------------
 # App Init
 # ------------------------
