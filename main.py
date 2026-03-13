@@ -28,23 +28,34 @@ app.add_middleware(
 # ------------------------
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logging.error(f"Error: {exc}")
+    logging.error(f"Unhandled Error: {exc}")
     return JSONResponse(
         status_code=500,
         content={"message": f"Internal Server Error: {str(exc)}"},
     )
 
 # ------------------------
-# Redis Setup
+# Redis Setup (Fail-safe)
 # ------------------------
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-redis_client = redis.Redis.from_url(REDIS_URL)
-CHANNEL = "notifications"  # <- Ensure this exists
+REDIS_URL = os.getenv("REDIS_URL")
+if not REDIS_URL:
+    raise Exception("REDIS_URL not set in environment variables")
+try:
+    redis_client = redis.Redis.from_url(REDIS_URL)
+    redis_client.ping()
+    logging.info(f"Connected to Redis at {REDIS_URL}")
+except Exception as e:
+    raise Exception(f"Cannot connect to Redis: {e}")
+
+CHANNEL = "notifications"
 
 # ------------------------
 # Firebase Setup
 # ------------------------
-cred = credentials.Certificate("serviceAccountKey.json")
+cred_path = "serviceAccountKey.json"
+if not os.path.exists(cred_path):
+    raise Exception(f"{cred_path} not found! Place your Firebase service account key here.")
+cred = credentials.Certificate(cred_path)
 firebase_admin.initialize_app(cred)
 
 # ------------------------
@@ -57,12 +68,12 @@ class ConnectionManager:
     async def connect(self, user_id, websocket: WebSocket):
         await websocket.accept()
         self.connections[user_id] = websocket
-        logging.info(f"user connected: {user_id}")
+        logging.info(f"User connected: {user_id}")
 
     def disconnect(self, user_id):
         if user_id in self.connections:
             del self.connections[user_id]
-            logging.info(f"user disconnected: {user_id}")
+            logging.info(f"User disconnected: {user_id}")
 
     async def send(self, user_id, message):
         ws = self.connections.get(user_id)
@@ -70,7 +81,7 @@ class ConnectionManager:
             try:
                 await ws.send_json(message)
             except Exception as e:
-                logging.warning(f"Failed to send message to {user_id}: {e}")
+                logging.warning(f"Failed to send to {user_id}: {e}")
 
 manager = ConnectionManager()
 
