@@ -33,8 +33,6 @@ async def global_exception_handler(request: Request, exc: Exception):
 # Redis setup
 REDIS_URL = os.getenv("REDIS_URL","redis://localhost:6379")
 redis_client = redis.Redis.from_url(REDIS_URL)
-CHANNEL = "notifications"
-
 # Firebase
 cred = credentials.Certificate("serviceAccountKey.json")
 firebase_admin.initialize_app(cred)
