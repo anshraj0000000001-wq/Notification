@@ -2,7 +2,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import firebase_admin
-from firebase_admin import credentials, auth
+from firebase_admin import credentials, auth as firebase_auth
 import redis, json, asyncio, logging, os
 
 # ------------------------
@@ -24,12 +24,13 @@ app.add_middleware(
 # Global exception handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    logging.error(f"Error: {exc}")
     return JSONResponse(
         status_code=500,
         content={"message": f"Internal Server Error: {str(exc)}"},
     )
 
-# Redis
+# Redis setup
 REDIS_URL = os.getenv("REDIS_URL","redis://localhost:6379")
 redis_client = redis.Redis.from_url(REDIS_URL)
 CHANNEL = "notifications"
@@ -45,20 +46,23 @@ class ConnectionManager:
     def __init__(self):
         self.connections = {}
 
-    async def connect(self,user_id,websocket:WebSocket):
+    async def connect(self, user_id, websocket: WebSocket):
         await websocket.accept()
         self.connections[user_id] = websocket
         logging.info(f"user connected {user_id}")
 
-    def disconnect(self,user_id):
+    def disconnect(self, user_id):
         if user_id in self.connections:
             del self.connections[user_id]
             logging.info(f"user disconnected {user_id}")
 
-    async def send(self,user_id,message):
+    async def send(self, user_id, message):
         ws = self.connections.get(user_id)
         if ws:
-            await ws.send_json(message)
+            try:
+                await ws.send_json(message)
+            except:
+                logging.warning(f"Failed to send message to {user_id}")
 
 manager = ConnectionManager()
 
@@ -67,7 +71,6 @@ manager = ConnectionManager()
 # ------------------------
 @app.get("/connected-users")
 async def get_connected_users():
-    """Return list of all currently connected user UIDs."""
     return {"users": list(manager.connections.keys())}
 
 # ------------------------
@@ -80,8 +83,8 @@ async def redis_listener():
         message = pubsub.get_message()
         if message and message["type"] == "message":
             data = json.loads(message["data"])
-            user_id = data["user_id"]
-            await manager.send(user_id,data)
+            user_id = data.get("user_id")
+            await manager.send(user_id, data)
         await asyncio.sleep(0.01)
 
 @app.on_event("startup")
@@ -92,16 +95,16 @@ async def startup_event():
 # WebSocket Endpoint
 # ------------------------
 @app.websocket("/ws")
-async def websocket_endpoint(websocket:WebSocket):
+async def websocket_endpoint(websocket: WebSocket):
     token = websocket.query_params.get("token")
     try:
-        decoded = auth.verify_id_token(token)
+        decoded = firebase_auth.verify_id_token(token)
         user_id = decoded["uid"]
     except:
         await websocket.close()
         return
 
-    await manager.connect(user_id,websocket)
+    await manager.connect(user_id, websocket)
     try:
         while True:
             await websocket.receive_text()
@@ -112,11 +115,30 @@ async def websocket_endpoint(websocket:WebSocket):
 # Notification API
 # ------------------------
 @app.post("/notify")
-async def notify(data:dict = Body(...)):
-    payload = {
-        "user_id":data["user_id"],
-        "type":"notification",
-        "message":data["message"]
-    }
-    redis_client.publish(CHANNEL,json.dumps(payload))
-    return {"status":"sent"}
+async def notify(data: dict = Body(...)):
+    message = data.get("message", "")
+    user_id = data.get("user_id", "").strip()
+
+    if not message:
+        return {"status": "failed", "reason": "Message cannot be empty"}
+
+    payload = {"type": "notification", "message": message}
+
+    # ---- Broadcast to all Firebase users ----
+    if user_id == "" or user_id.upper() == "ALL":
+        try:
+            page = firebase_auth.list_users()
+            uids = [user.uid for user in page.users]
+            for uid in uids:
+                await manager.send(uid, {**payload, "user_id": uid})
+            logging.info(f"Broadcast sent to {len(uids)} users")
+        except Exception as e:
+            logging.error(f"Failed to broadcast: {e}")
+            return {"status": "failed", "reason": str(e)}
+        return {"status": "broadcast_sent", "users": len(uids)}
+
+    # ---- Single user ----
+    else:
+        await manager.send(user_id, {**payload, "user_id": user_id})
+        logging.info(f"Message sent to {user_id}")
+        return {"status": "sent", "user_id": user_id}
